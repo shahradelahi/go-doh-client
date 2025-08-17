@@ -1,26 +1,27 @@
 # .golangci.yml
 
-run:
-  timeout: 5m
-  skip-dirs-use-default: true
+# Defines the configuration version.
+version: "2"
 
+# Options for analysis running.
+run:
+  # Timeout for total work.
+  timeout: 5m
+
+# Linters configuration.
 linters:
-  disable-all: true
+  # Disable all linters by default and enable only specific ones.
+  default: none
   enable:
     - errcheck
-    - gosimple
     - govet
     - ineffassign
     - staticcheck
-    - typecheck
     - unused
     - cyclop
     - durationcheck
     - errname
     - errorlint
-    - exportloopref
-    - gofmt
-    - goimports
     - lll
     - misspell
     - nilerr
@@ -29,23 +30,29 @@ linters:
     - revive
     - rowserrcheck
     - sqlclosecheck
-    - stylecheck
     - unconvert
     - wastedassign
 
-linters-settings:
-  cyclop:
-    max-complexity: 20
-    package-average: 10.0
-    skip-tests: true
+  # Linters specific settings.
+  settings:
+    cyclop:
+      # The maximal code complexity to report.
+      max-complexity: 20
+      # The maximal average package complexity.
+      package-average: 10.0
 
+  # Defines a set of rules to ignore issues.
+  exclusions:
+    rules:
+      # Exclude some linters from running on tests files.
+      - path: _test\.go$
+        linters:
+          - cyclop
+          - errcheck
+
+# Issues configuration.
 issues:
+  # Maximum issues count per one linter. 0 to disable.
   max-issues-per-linter: 0
+  # Maximum count of issues with the same text. 0 to disable.
   max-same-issues: 0
-  exclude-rules:
-    - path: _test\.go
-      linters:
-        - errcheck
-    - source: "^//go:generate "
-      linters:
-        - lll

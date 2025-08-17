@@ -1,3 +1,4 @@
+// Package doh provides a simple and flexible Go client library for DNS over HTTPS (DoH).
 package doh
 
 import (

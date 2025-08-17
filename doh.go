@@ -1,3 +1,4 @@
+// Package doh provides a simple and flexible Go client library for DNS over HTTPS (DoH).
 package doh
 
 import (
@@ -15,8 +16,8 @@ import (
 	"time"
 )
 
-// DoHOption is a function that configures a DoH client.
-type DoHOption func(*DoH)
+// Option is a function that configures a DoH client.
+type Option func(*DoH)
 
 // DoH is a DNS-over-HTTPS client.
 type DoH struct {
@@ -29,28 +30,28 @@ type DoH struct {
 }
 
 // WithProviders sets the list of DoH server URLs.
-func WithProviders(urls []string) DoHOption {
+func WithProviders(urls []string) Option {
 	return func(d *DoH) {
 		d.urls = urls
 	}
 }
 
 // WithHTTPClient allows providing a custom http.Client.
-func WithHTTPClient(client *http.Client) DoHOption {
+func WithHTTPClient(client *http.Client) Option {
 	return func(d *DoH) {
 		d.httpClient = client
 	}
 }
 
 // WithTransport allows providing a custom http.Transport.
-func WithTransport(transport http.RoundTripper) DoHOption {
+func WithTransport(transport http.RoundTripper) Option {
 	return func(d *DoH) {
 		d.httpClient.Transport = transport
 	}
 }
 
 // WithDialContext allows providing a custom dial context function.
-func WithDialContext(dialer func(ctx context.Context, network, addr string) (net.Conn, error)) DoHOption {
+func WithDialContext(dialer func(ctx context.Context, network, addr string) (net.Conn, error)) Option {
 	return func(d *DoH) {
 		transport, ok := d.httpClient.Transport.(*http.Transport)
 		if !ok {
@@ -72,14 +73,14 @@ func WithDialContext(dialer func(ctx context.Context, network, addr string) (net
 }
 
 // WithTimeout sets the total timeout for the HTTP client.
-func WithTimeout(timeout time.Duration) DoHOption {
+func WithTimeout(timeout time.Duration) Option {
 	return func(d *DoH) {
 		d.httpClient.Timeout = timeout
 	}
 }
 
 // New returns a new DoH client, configured with the provided options.
-func New(opts ...DoHOption) *DoH {
+func New(opts ...Option) *DoH {
 	defaultClient := &http.Client{
 		Timeout: 5 * time.Second,
 		Transport: &http.Transport{
@@ -188,18 +189,9 @@ func (c *DoH) Query(ctx context.Context, d Domain, t Type, s ...ECS) (*Response,
 // fastQuery do query and returns the fastest result
 func (c *DoH) fastQuery(ctx context.Context,
 	urls map[int]string, d Domain, t Type, s ...ECS) (*Response, error) {
-	cacheKey := ""
 	if c.cache != nil {
-		var ss string
-		if len(s) > 0 && s[0] != "" {
-			ss = strings.TrimSpace(string(s[0]))
-		}
-		hasher := sha1.New()
-		hasher.Write([]byte(string(d) + string(t) + ss))
-		cacheKey = hex.EncodeToString(hasher.Sum(nil))
-		v := c.cache.Get(cacheKey)
-		if v != nil {
-			return v.(*Response), nil
+		if resp, ok := c.checkCache(d, t, s...); ok {
+			return resp, nil
 		}
 	}
 
@@ -208,40 +200,58 @@ func (c *DoH) fastQuery(ctx context.Context,
 
 	r := make(chan interface{})
 	for originalIndex, u := range urls {
-		go func(k int, u string) {
-			rsp, err := c.query(ctxs, u, d, t, s...)
-			c.Lock()
-			if _, ok := c.stats[k]; !ok {
-				c.stats[k] = []interface{}{0, 0, 100.0}
-			}
-			c.stats[k][1] = c.stats[k][1].(int) + 1
-			if err != nil {
-				c.stats[k][0] = c.stats[k][0].(int) + 1
-			}
-			c.stats[k][2] = float64(c.stats[k][0].(int)) / float64(c.stats[k][1].(int)) * 100
-			c.Unlock()
-
-			if err == nil {
-				r <- rsp
-			} else {
-				r <- err
-			}
-		}(originalIndex, u)
+		go c.goQuery(ctxs, originalIndex, u, d, t, r, s...)
 	}
 
+	resp, err := c.collectResponses(r, len(urls))
+	if err == nil && c.cache != nil {
+		c.updateCache(d, t, resp, s...)
+	}
+
+	return resp, err
+}
+
+func (c *DoH) checkCache(d Domain, t Type, s ...ECS) (*Response, bool) {
+	var ss string
+	if len(s) > 0 && s[0] != "" {
+		ss = strings.TrimSpace(string(s[0]))
+	}
+	hasher := sha1.New()
+	hasher.Write([]byte(string(d) + string(t) + ss))
+	cacheKey := hex.EncodeToString(hasher.Sum(nil))
+	v := c.cache.Get(cacheKey)
+	if v != nil {
+		return v.(*Response), true
+	}
+	return nil, false
+}
+
+func (c *DoH) goQuery(ctx context.Context, k int, u string, d Domain, t Type, r chan<- interface{}, s ...ECS) {
+	rsp, err := c.query(ctx, u, d, t, s...)
+	c.Lock()
+	if _, ok := c.stats[k]; !ok {
+		c.stats[k] = []interface{}{0, 0, 100.0}
+	}
+	c.stats[k][1] = c.stats[k][1].(int) + 1
+	if err != nil {
+		c.stats[k][0] = c.stats[k][0].(int) + 1
+	}
+	c.stats[k][2] = float64(c.stats[k][0].(int)) / float64(c.stats[k][1].(int)) * 100
+	c.Unlock()
+
+	if err == nil {
+		r <- rsp
+	} else {
+		r <- err
+	}
+}
+
+func (c *DoH) collectResponses(r chan interface{}, totalUrls int) (*Response, error) {
 	var firstError error
 	total := 0
 	for v := range r {
 		total++
 		if resp, ok := v.(*Response); ok {
-			cancels()
-			if cacheKey != "" {
-				ttl := 30
-				if len(resp.Answer) > 0 {
-					ttl = resp.Answer[0].TTL
-				}
-				c.cache.Set(cacheKey, resp, int64(ttl))
-			}
 			return resp, nil
 		} else if err, ok := v.(error); ok {
 			if firstError == nil {
@@ -249,8 +259,7 @@ func (c *DoH) fastQuery(ctx context.Context,
 			}
 		}
 
-		if total >= len(urls) {
-			close(r)
+		if total >= totalUrls {
 			break
 		}
 	}
@@ -259,11 +268,36 @@ func (c *DoH) fastQuery(ctx context.Context,
 		return nil, firstError
 	}
 
-	return nil, fmt.Errorf("doh: all %d providers failed to respond", len(urls))
+	return nil, fmt.Errorf("doh: all %d providers failed to respond", totalUrls)
 }
 
-// query do DoH query with the edns0-client-subnet option
+func (c *DoH) updateCache(d Domain, t Type, resp *Response, s ...ECS) {
+	var ss string
+	if len(s) > 0 && s[0] != "" {
+		ss = strings.TrimSpace(string(s[0]))
+	}
+	hasher := sha1.New()
+	hasher.Write([]byte(string(d) + string(t) + ss))
+	cacheKey := hex.EncodeToString(hasher.Sum(nil))
+	ttl := 30
+	if len(resp.Answer) > 0 {
+		ttl = resp.Answer[0].TTL
+	}
+	c.cache.Set(cacheKey, resp, int64(ttl))
+}
+
+// query builds and executes a DoH query.
 func (c *DoH) query(ctx context.Context, u string, d Domain, t Type, s ...ECS) (*Response, error) {
+	req, err := c.buildRequest(ctx, u, d, t, s...)
+	if err != nil {
+		return nil, err
+	}
+
+	return c.doRequest(req)
+}
+
+// buildRequest creates a new HTTP request for the given DoH query parameters.
+func (c *DoH) buildRequest(ctx context.Context, u string, d Domain, t Type, s ...ECS) (*http.Request, error) {
 	name, err := d.Punycode()
 	if err != nil {
 		return nil, fmt.Errorf("doh: failed to convert domain to punycode: %w", err)
@@ -294,12 +328,20 @@ func (c *DoH) query(ctx context.Context, u string, d Domain, t Type, s ...ECS) (
 	req.Header.Set("Accept", "application/dns-json")
 	req.Header.Set("User-Agent", fmt.Sprintf("%s/%s (%s)", Name, Version, Source))
 
+	return req, nil
+}
+
+// doRequest executes the HTTP request and parses the response.
+func (c *DoH) doRequest(req *http.Request) (*Response, error) {
+	u := req.URL.String()
 	rsp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("doh: http request failed for %s: %w", u, err)
 	}
+	defer func() {
+		_ = rsp.Body.Close()
+	}()
 
-	defer rsp.Body.Close()
 	if rsp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("doh: provider %s returned unexpected status code: %d", u, rsp.StatusCode)
 	}
